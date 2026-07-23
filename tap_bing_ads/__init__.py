@@ -3,6 +3,7 @@
 import asyncio
 import json
 import csv
+import hashlib
 import sys
 import re
 import io
@@ -820,12 +821,27 @@ async def poll_report(client, account_id, report_name, start_date, end_date, req
 def log_retry_attempt(details):
     LOGGER.info('Retrieving report timed out, triggering retry #%d', details.get('tries'))
 
+SURROGATE_KEY = '_sg_key'
+
+def surrogate_key(row, natural_key):
+    '''Stable md5 over the coalesced natural-key column values.
+
+    Report streams have no single natural primary key, and many of the natural-grain
+    columns (e.g. Goal/GoalType, PostalCode) are frequently NULL -- so they cannot form a
+    Postgres PRIMARY KEY directly. Hashing the ordered, null-coalesced natural key yields a
+    single always-non-null column the loader can upsert on. Deterministic across runs, so
+    re-pulling the same (day, cell) overwrites rather than appends.
+    '''
+    joined = '|'.join(
+        '' if row.get(col) is None else str(row.get(col)) for col in natural_key)
+    return hashlib.md5(joined.encode('utf-8')).hexdigest()
+
 # retry the request for 5 times when Timeout error occurs
 @backoff.on_exception(backoff.constant,
                       (requests.exceptions.Timeout ,requests.exceptions.ConnectionError),
                       max_tries=5,
                       on_backoff=log_retry_attempt)
-def stream_report(stream_name, report_name, url, report_time):
+def stream_report(stream_name, report_name, url, report_time, natural_key=None):
     # Write stream report with backoff of ConnectionError
     with metrics.http_request_timer('download_report'):
         # Set request timeout with config param `request_timeout`.
@@ -848,6 +864,8 @@ def stream_report(stream_name, report_name, url, report_time):
                     for row in reader:
                         type_report_row(row)
                         row['_sdc_report_datetime'] = report_time
+                        if natural_key:
+                            row[SURROGATE_KEY] = surrogate_key(row, natural_key)
                         singer.write_record(stream_name, row)
                         counter.increment()
 
@@ -911,7 +929,18 @@ async def sync_report_interval(client, account_id, report_stream,
     report_name = pascalcase(report_stream.stream)
 
     report_schema = get_report_schema(client, report_name)
-    singer.write_schema(report_stream.stream, report_schema, [])
+    # The catalog's table-key-properties (set via Meltano metadata) names the natural grain.
+    # We don't key on those columns directly -- several are frequently NULL and a Postgres PK
+    # forbids nulls -- instead we emit a single md5 surrogate over them (see surrogate_key)
+    # and use that as the stream key so the loader can upsert. No key defined -> append.
+    natural_key = (
+        metadata.to_map(report_stream.metadata).get((), {}).get('table-key-properties') or [])
+    if natural_key:
+        report_schema.setdefault('properties', {})[SURROGATE_KEY] = {'type': 'string'}
+        key_properties = [SURROGATE_KEY]
+    else:
+        key_properties = []
+    singer.write_schema(report_stream.stream, report_schema, key_properties)
 
     report_time = arrow.get().isoformat()
 
@@ -949,7 +978,8 @@ async def sync_report_interval(client, account_id, report_stream,
         stream_report(report_stream.stream,
                       report_name,
                       download_url,
-                      report_time)
+                      report_time,
+                      natural_key)
         singer.write_bookmark(STATE, state_key, 'request_id', None)
         singer.write_bookmark(STATE, state_key, 'date', end_date.isoformat())
         singer.write_state(STATE)
