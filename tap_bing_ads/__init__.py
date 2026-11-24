@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import asyncio
+import copy
 import json
 import csv
 import hashlib
@@ -425,6 +426,26 @@ def get_core_schema(client, obj):
     type_map = get_type_map(client)
     return type_map[obj]
 
+
+# Bing returns AdGroup and Ad objects without the id of their parent (the API
+# is called per parent), so the tap adds it: AdGroup.CampaignId, Ad.AdGroupId.
+PARENT_ID_FIELDS = {'AdGroup': 'CampaignId', 'Ad': 'AdGroupId'}
+
+
+def with_parent_id(schema, obj):
+    '''Copy of an AdGroup / Ad schema with its injected parent id property.'''
+    field = PARENT_ID_FIELDS[obj]
+    schema = copy.deepcopy(schema)
+    schema.setdefault('properties', {})[field] = {'type': ['null', 'integer']}
+    return schema
+
+
+def add_parent_id(records, field, parent_id):
+    '''Set the parent id on every record (the API omits it).'''
+    for record in records:
+        record[field] = parent_id
+    return records
+
 def discover_core_objects():
     core_object_streams = []
 
@@ -448,11 +469,11 @@ def discover_core_objects():
     core_object_streams.append(get_stream_def('campaigns', campaign_schema, pks=['Id']))
 
     # Load AdGroup's schemas
-    ad_group_schema = get_core_schema(client, 'AdGroup')
+    ad_group_schema = with_parent_id(get_core_schema(client, 'AdGroup'), 'AdGroup')
     core_object_streams.append(get_stream_def('ad_groups', ad_group_schema, pks=['Id']))
 
     # Load Ad's schemas
-    ad_schema = get_core_schema(client, 'Ad')
+    ad_schema = with_parent_id(get_core_schema(client, 'Ad'), 'Ad')
     core_object_streams.append(get_stream_def('ads', ad_schema, pks=['Id']))
 
     return core_object_streams
@@ -696,13 +717,13 @@ def sync_ad_groups(client, account_id, campaign_ids, selected_streams):
         response_dict = sobject_to_dict(response)
 
         if 'AdGroup' in response_dict:
-            ad_groups = sobject_to_dict(response)['AdGroup']
+            ad_groups = add_parent_id(sobject_to_dict(response)['AdGroup'], 'CampaignId', campaign_id)
 
             if 'ad_groups' in selected_streams:
                 LOGGER.info('Syncing AdGroups for Account: %s, Campaign: %s',
                     account_id, campaign_id)
                 selected_fields = get_selected_fields(selected_streams['ad_groups'])
-                singer.write_schema('ad_groups', get_core_schema(client, 'AdGroup'), ['Id'])
+                singer.write_schema('ad_groups', with_parent_id(get_core_schema(client, 'AdGroup'), 'AdGroup'), ['Id'])
                 with metrics.record_counter('ad_groups') as counter:
                     singer.write_records('ad_groups',
                                          filter_selected_fields_many(selected_fields, ad_groups))
@@ -723,16 +744,18 @@ def sync_ads(client, selected_streams, ad_group_ids):
                     'ExpandedText',
                     'Product',
                     'Text',
-                    'Image'
+                    'Image',
+                    'ResponsiveAd',
+                    'ResponsiveSearch'
                 ]
             })
         response_dict = sobject_to_dict(response)
 
         if 'Ad' in response_dict:
             selected_fields = get_selected_fields(selected_streams['ads'])
-            singer.write_schema('ads', get_core_schema(client, 'Ad'), ['Id'])
+            singer.write_schema('ads', with_parent_id(get_core_schema(client, 'Ad'), 'Ad'), ['Id'])
             with metrics.record_counter('ads') as counter:
-                ads = response_dict['Ad']
+                ads = add_parent_id(response_dict['Ad'], 'AdGroupId', ad_group_id)
                 singer.write_records('ads', filter_selected_fields_many(selected_fields, ads))
                 counter.increment(len(ads))
 
