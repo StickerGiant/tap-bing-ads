@@ -57,6 +57,8 @@ REPORTING_FIELD_TYPES = {
     'Clicks': 'integer',
     'ConversionRate': 'number',
     'Conversions': 'number',
+    'ConversionsQualified': 'number',
+    'AllConversionsQualified': 'number',
     'CostPerAssist': 'number',
     'CostPerConversion': 'number',
     'Ctr': 'number',

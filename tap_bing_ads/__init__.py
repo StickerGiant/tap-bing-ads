@@ -281,6 +281,10 @@ def get_array_type(array_type):
     return array_obj
 
 def get_complex_type_elements(inherited_types, wsdl_type):
+    # An empty complexType / sequence (newer bingads WSDLs have some, e.g. 13.0.31):
+    # no elements, an object without properties.
+    if not wsdl_type.rawchildren or not wsdl_type.rawchildren[0].rawchildren:
+        return []
     ## inherited type
     if isinstance(wsdl_type.rawchildren[0].rawchildren[0], suds.xsd.sxbasic.Extension): # pylint: disable=no-else-return
         abstract_base = wsdl_type.rawchildren[0].rawchildren[0].ref[0]
